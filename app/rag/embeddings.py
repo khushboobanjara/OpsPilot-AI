@@ -90,15 +90,26 @@ class SentenceTransformerEmbedder:
 
 
 _WORD = re.compile(r"[a-z0-9]+(?:[-'][a-z0-9]+)*")
-_STOP = frozenset("a an and are as at be by for from has have in is it its of on or that the this to was were will with".split())
-
+_STOP = frozenset("a an and are as at be by for from has have in is it its of on or that the this to was were will with what which who why how do does did can could would should".split())
 
 def _stem(w: str) -> str:
-    for suf in ("ing", "ed", "es", "s"):
-        if w.endswith(suf) and len(w) - len(suf) >= 3:
-            return w[: -len(suf)]
-    return w
+    w = w.lower()
 
+    # Handle common plurals without damaging the root word.
+    if w.endswith("ies") and len(w) > 4:
+        return w[:-3] + "y"
+
+    if w.endswith("s") and not w.endswith(("ss", "us", "is")) and len(w) > 3:
+        return w[:-1]
+
+    # Handle common verb endings.
+    if w.endswith("ing") and len(w) > 5:
+        return w[:-3]
+
+    if w.endswith("ed") and len(w) > 4:
+        return w[:-2]
+
+    return w
 
 class HashingEmbedder:
     """Signed feature hashing of stemmed words and word pairs. Deterministic across processes (no Python hash())."""
