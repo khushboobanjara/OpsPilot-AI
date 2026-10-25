@@ -1,4 +1,4 @@
-"""One chat turn: the model asks for tools, the MCP core runs them as the signed-in user, the answer is checked.
+﻿"""One chat turn: the model asks for tools, the MCP core runs them as the signed-in user, the answer is checked.
 
 Guarantees, and where each comes from
   * only the user's tools are offered; every call is authorised, validated, rate-limited and audited by the MCP core
@@ -47,7 +47,7 @@ class Limits:
     hardcode: bool = False                 # fixed rules first (app/chat/rules.py); the route turns this on from OPSPILOT_CHAT_HARDCODE
     answer_mode: str = "auto"              # documents: auto = quote when possible, llm = always the model
     direct_min_overlap: float = 0.5
-    direct_passages: int = 4
+    direct_passages: int = 8
     history_chars: int = 2000              # per earlier message (the route sets a smaller value: history is re-sent, and billed in tokens, on every call)
     max_chars: int = 2000
     max_answer_chars: int = 4000
@@ -278,7 +278,8 @@ def answer(principal, message: str, history: list[dict], *, llm, server, role_la
             passages.update({p["ref"]: p for p in found})
             res.passages_retrieved = len(passages)
             tool_texts.append(out.content)
-            quote = None if (limits.answer_mode == "llm" or rules.needs_llm(message)) else rag_direct.pick(message, found, limits.direct_min_overlap)
+            special_scope = any(term in message.lower() for term in ("special project", "project-specific", "project specific", "project code"))
+            quote = None if (limits.answer_mode == "llm" or rules.needs_llm(message) or special_scope) else rag_direct.pick(message, found, limits.direct_min_overlap)
             if quote:                                     # verbatim quotes with citations: nothing for a model to get wrong
                 cited = [passages[r] for r in quote.refs]
                 res.answer, res.verified, res.route = quote.text[: limits.max_answer_chars], True, "direct"
@@ -371,6 +372,47 @@ def answer(principal, message: str, history: list[dict], *, llm, server, role_la
 
         if docs_on and doc_calls and not passages and not mcp_grounded:
             return no_document_evidence()
+
+        # Prevent a general hotel limit from being presented as project-specific.
+        special_scope_question = bool(re.search(
+            r"special project|project[- ]specific|project code|TRAVEL[- ]?\d+",
+            message,
+            re.IGNORECASE,
+        ))
+        if special_scope_question and re.search(r"hotel|accommodation|lodging", message, re.IGNORECASE) and passages:
+            has_project_specific_evidence = any(
+                re.search(r"special project|project[- ]specific|project code|TRAVEL[- ]?\d+", p.get("text", ""), re.IGNORECASE)
+                and re.search(r"hotel|accommodation|lodging", p.get("text", ""), re.IGNORECASE)
+                for p in passages.values()
+            )
+            has_scope_qualification = bool(re.search(
+                r"separate.{0,50}(limit|rule)|does not establish|not specify|not stated|not provided",
+                text,
+                re.IGNORECASE,
+            ))
+            if not has_project_specific_evidence and not has_scope_qualification:
+                text = (
+                    "The general domestic hotel accommodation limit is INR 6,000 per night before taxes [DOC-5-C4]. "
+                    "The retrieved passages do not establish a separate hotel limit for the named special project."
+                )
+
+        # Do not attach unrelated retrieved passages to an explicit abstention.
+        if docs_on and not mcp_grounded and passages and re.search(
+            r"\b(?:provided|uploaded|available|retrieved)\s+documents?\b"
+            r".{0,120}\b(?:do not contain|don't contain|do not mention|"
+            r"don't mention|contain no information|have no information)\b",
+            text,
+            re.IGNORECASE | re.DOTALL,
+        ):
+            res.answer = rag_grounding.NO_DOCUMENT_EVIDENCE_TEXT
+            res.verified = True
+            res.grounded = False
+            res.blocked = False
+            res.reason = "no_document_evidence"
+            res.citations = []
+            res.sources = []
+            res.route = "rules"
+            return res
 
         ev.allow_premises = docs_on and bool(passages) and not mcp_grounded      # what-if values count as the user's premise, see verifier.py
         problems = find_unsupported(text, ev)             # check 1: figures

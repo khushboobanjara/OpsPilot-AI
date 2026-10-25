@@ -1,23 +1,55 @@
-"""Answer a document question WITHOUT a language model, by quoting. Pure Python.
 
-Given the passages retrieved for a question, pick the sentences that contain most of the question's content words and return
-them verbatim, each with its citation. Because the text is copied from the documents, it cannot hallucinate; and it costs no
-tokens. It is deliberately modest: when no sentence covers enough of the question, `pick` returns None and the caller falls back
-to one model call (see app/chat/service.py). Questions that need reasoning (a what-if, "explain", "compare") never come here.
-"""
+"""Answer document questions without an LLM by quoting source sentences."""
+
 import re
 from dataclasses import dataclass
 
 from app.rag.chunking import _SENTENCE_END
 from app.rag.embeddings import _STOP, _stem
 
+
 _GENERIC = frozenset(
-    "what which who whom when where how many much does did can could would should will please tell show give about policy policies "
-    "company document documents say says said state states stated mention mentions according our your their any there here need needs "
-    "want know like get have has had been being also".split())
+    (
+        "what which who whom when where why how many much does did do "
+        "can could would should will please tell show give about policy "
+        "policies company document documents say says said state states "
+        "stated mention mentions according our your their any there here "
+        "need needs want know like get have has had been being also is are "
+        "was were the a an for to of in on at by from with and or it this that"
+    ).split()
+)
+
 _BULLET = re.compile(r"^\s*(?:[-*\u2022]|\d{1,3}[.)])\s+")
+_HEADING = re.compile(r"^\s*\d+(?:\.\d+)*[.)]?\s+(.+?)\s*$")
+
 INTRO = "According to the company documents:"
-FOOTER = "(Quoted directly from the documents. Ask me to \"explain\" or \"summarise\" if you want an AI-written answer.)"
+FOOTER = (
+    '(Quoted directly from the documents. Ask me to "explain" or '
+    '"summarise" if you want an AI-written answer.)'
+)
+
+MAX_QUOTE_CHARS = 260
+MAX_DIRECT_SENTENCES = 1
+_WINDOW_WORDS, _WINDOW_STEP = 32, 16
+
+# Normalize equivalent policy terms to a single canonical term.
+_SYNONYM_MAP = {
+    "hotel": "hotel",
+    "accommodation": "hotel",
+    "lodging": "hotel",
+    "reimbursement": "reimbursement",
+    "reimbursable": "reimbursement",
+    "reimbursed": "reimbursement",
+    "reimburs": "reimbursement",
+    "reimburse": "reimbursement",
+    "limit": "limit",
+    "maximum": "limit",
+    "max": "limit",
+    "cap": "limit",
+    "expense": "expense",
+    "expenses": "expense",
+    "cost": "expense",
+}
 
 
 @dataclass
@@ -27,64 +59,203 @@ class Direct:
 
 
 def terms(text: str) -> set[str]:
-    return {_stem(w) for w in re.findall(r"[a-z0-9][a-z0-9'-]*", text.lower()) if len(w) > 2 and w not in _STOP and w not in _GENERIC}
+    """Return normalized, meaningful terms."""
+    return {
+        _stem(word)
+        for word in re.findall(r"[a-z0-9][a-z0-9'-]*", text.lower())
+        if len(word) > 2 and word not in _STOP and word not in _GENERIC
+    }
 
 
-MAX_QUOTE_CHARS = 260
-_WINDOW_WORDS, _WINDOW_STEP = 32, 16
+def _match_terms(text: str) -> set[str]:
+    """Normalize terms and their common policy synonyms."""
+    return {
+        _SYNONYM_MAP.get(word, word)
+        for word in terms(text)
+    }
 
 
-def _windows(s: str) -> list[str]:
-    """A run of text with no sentence end (typically a table flattened by PDF extraction) is cut into overlapping windows of about
-    32 words, each still a verbatim stretch of the document, marked with an ellipsis where it was cut."""
-    words = s.split()
-    out = []
-    for i in range(0, max(1, len(words) - _WINDOW_WORDS + _WINDOW_STEP), _WINDOW_STEP):
-        piece = " ".join(words[i:i + _WINDOW_WORDS])
-        out.append(("\u2026 " if i else "") + piece + (" \u2026" if i + _WINDOW_WORDS < len(words) else ""))
-    return out
+def _windows(sentence: str) -> list[str]:
+    """Split unusually long text into overlapping verbatim windows."""
+    words = sentence.split()
+
+    if len(words) <= _WINDOW_WORDS:
+        return [sentence]
+
+    result = []
+    for start in range(0, len(words), _WINDOW_STEP):
+        piece_words = words[start : start + _WINDOW_WORDS]
+        if not piece_words:
+            break
+
+        piece = " ".join(piece_words)
+
+        if start > 0:
+            piece = "\u2026 " + piece
+        if start + _WINDOW_WORDS < len(words):
+            piece += " \u2026"
+
+        result.append(piece)
+
+    return result
 
 
 def sentences(text: str) -> list[str]:
-    out = []
-    for line in text.split("\n"):
+    """Extract sentences, splitting unusually long sentences into windows."""
+    result = []
+
+    for line in text.splitlines():
         line = _BULLET.sub("", line).strip()
-        for s in _SENTENCE_END.split(line):
-            s = s.strip()
-            if len(s) < 25:
+
+        if not line or _HEADING.match(line):
+            continue
+
+        for sentence in _SENTENCE_END.split(line):
+            sentence = sentence.strip()
+
+            if len(sentence) < 25:
                 continue
-            out.extend(_windows(s) if len(s) > MAX_QUOTE_CHARS else [s])
-    return out
+
+            if len(sentence) > MAX_QUOTE_CHARS:
+                result.extend(_windows(sentence))
+            else:
+                result.append(sentence)
+
+    return result
 
 
-def pick(question: str, passages: list[dict], min_overlap: float = 0.5, max_sentences: int = 3) -> Direct | None:
-    """passages: dicts with ref, section, text, best first. None when nothing covers enough of the question."""
-    q = terms(question)
-    if len(q) < 2:                                   # too vague to match on words: let the model (or the user) refine it
+def _section_sentences(
+    text: str,
+    fallback_section: str = "",
+) -> list[tuple[str, str]]:
+    """Return sentences paired with the heading active when they appear."""
+    active_section = fallback_section
+    result = []
+
+    for line in text.splitlines():
+        line = _BULLET.sub("", line).strip()
+
+        if not line:
+            continue
+
+        match = _HEADING.match(line)
+
+        if (
+            match
+            and len(line) <= 100
+            and not re.search(r"[.!?]\s*$", line)
+        ):
+            active_section = line
+            continue
+
+        for sentence in _SENTENCE_END.split(line):
+            sentence = sentence.strip()
+
+            if len(sentence) < 25:
+                continue
+
+            pieces = (
+                _windows(sentence)
+                if len(sentence) > MAX_QUOTE_CHARS
+                else [sentence]
+            )
+
+            result.extend((piece, active_section) for piece in pieces)
+
+    return result
+
+
+def pick(
+    question: str,
+    passages: list[dict],
+    min_overlap: float = 0.5,
+    max_sentences: int = MAX_DIRECT_SENTENCES,
+) -> Direct | None:
+    """Select the best-matching verbatim sentence with its citation."""
+    question_terms = _match_terms(question)
+
+    if len(question_terms) < 2 or not passages:
         return None
-    scored = []                                       # (score, own-word hits, -passage rank, -position, sentence, ref)
-    for rank, p in enumerate(passages):
-        context = terms(p.get("section") or "")
-        for pos, s in enumerate(sentences(p.get("text") or "")):
-            own = q & terms(s)
-            hit = q & (terms(s) | context)
-            if len(hit) >= 2:
-                # ties (a heading can cover every term for every sentence under it) go to the sentence that itself uses more of the words
-                scored.append((len(hit) / len(q), len(own), -rank, -pos, s, p["ref"]))
+
+    records = []
+
+    for rank, passage in enumerate(passages):
+        text = passage.get("text") or ""
+        fallback_section = passage.get("section") or ""
+
+        for position, (sentence, heading) in enumerate(
+            _section_sentences(text, fallback_section)
+        ):
+            records.append(
+                (
+                    rank,
+                    position,
+                    sentence,
+                    passage.get("ref", "UNKNOWN"),
+                    heading,
+                )
+            )
+
+    if not records:
+        return None
+
+    scored = []
+
+    for rank, position, sentence, ref, heading in records:
+        sentence_terms = _match_terms(sentence)
+        overlap = len(question_terms & sentence_terms)
+        coverage = overlap / len(question_terms)
+
+        heading_terms = _match_terms(heading)
+        heading_overlap = len(question_terms & heading_terms)
+        heading_bonus = 0.05 if heading_overlap >= 2 else 0.0
+
+        # Require at least two meaningful matching terms.
+        if overlap < 2 or coverage < min_overlap:
+            continue
+
+        score = coverage + heading_bonus
+        scored.append(
+            (score, coverage, rank, position, sentence, ref)
+        )
+
     if not scored:
         return None
-    scored.sort(reverse=True)
-    best = scored[0][0]
-    if best < min_overlap:
-        return None
-    chosen, seen = [], set()
-    for sc, own, rank, pos, s, ref in scored:
-        if sc < max(min_overlap, best - 0.15) or s in seen:
+
+    scored.sort(
+        key=lambda item: (
+            -item[0],
+            -item[1],
+            item[2],
+            item[3],
+        )
+    )
+
+    chosen = []
+    seen_sentences = set()
+
+    for _, _, _, _, sentence, ref in scored:
+        normalized = sentence.casefold()
+
+        if normalized in seen_sentences:
             continue
-        seen.add(s)
-        chosen.append((-rank, -pos, s, ref))
-        if len(chosen) >= max_sentences:
+
+        seen_sentences.add(normalized)
+        chosen.append((sentence, ref))
+
+        if len(chosen) >= max(1, max_sentences):
             break
-    chosen.sort()                                     # passage order, then position: reads like the document
-    lines = [f"- {s} [{ref}]" for _, _, s, ref in chosen]
-    return Direct("\n".join([INTRO, *lines, "", FOOTER]), list(dict.fromkeys(ref for *_, ref in chosen)))
+
+    if not chosen:
+        return None
+
+    quoted_lines = [
+        f"- {sentence} [{ref}]"
+        for sentence, ref in chosen
+    ]
+    refs = list(dict.fromkeys(ref for _, ref in chosen))
+
+    return Direct(
+        text="\n".join([INTRO, *quoted_lines, "", FOOTER]),
+        refs=refs,
+    )
