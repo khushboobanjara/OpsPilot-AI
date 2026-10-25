@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 .venv/
 __pycache__/
 *.pyc
@@ -13,48 +12,18 @@ data/rag/
 models/*.meta.json
 models/candidates/
 models/archive/
-=======
-# Secrets and local environment
-.env
-
-# Python
-__pycache__/
-*.pyc
-venv/
-.venv/
-
-# Deployment / runtime
-.vercel/
-logs/
-.pytest_cache/
-backup/*.sql
-
-# Generated local credentials / local test outputs
-.env.*.local
->>>>>>> 7054a180b5f6da5609ab045ecaa17bd840c09873
 
 # Python virtual environments
 venv/
-.venv/
-__pycache__/
-*.py[cod]
+.env.*
 
-venv/
-.venv/
-.env
-__pycache__/
-.pytest_cache/
+# Build and test artifacts
+build/
+dist/
+*.egg-info/
+.coverage
+htmlcov/
 
-# Local Git backup
-.git-backup/
-
-# Python environments
-venv/
-.venv/
-
-# Secrets
-.env
-
-# Python cache
-__pycache__/
-*.pyc
+# Logs and temporary files
+*.log
+*.tmp
