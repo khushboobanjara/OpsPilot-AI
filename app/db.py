@@ -247,18 +247,16 @@ def _add_missing_columns() -> None:
 
 
 def _ensure_audit_triggers() -> None:
-    """Idempotent: installs whichever append-only triggers are missing (also on audit tables that predate them)."""
-    from sqlalchemy import text
+    """Install append-only audit triggers on databases that support them."""
     dialect = engine.dialect.name
-    triggers = [(n, ddl) for n, d, ddl in _AUDIT_TRIGGERS if d == dialect]
-    if not triggers:
+
+    # SQLite supports these triggers. TiDB does not support MySQL triggers.
+    if dialect != "sqlite":
         return
+
+    triggers = [(name, ddl) for name, db_dialect, ddl in _AUDIT_TRIGGERS
+                if db_dialect == dialect]
+
     with engine.begin() as conn:
-        if dialect == "mysql":
-            # MySQL < 8.0.29 has no CREATE TRIGGER IF NOT EXISTS, so look first.
-            existing = {r[0] for r in conn.execute(text(
-                "SELECT TRIGGER_NAME FROM information_schema.TRIGGERS "
-                "WHERE TRIGGER_SCHEMA = DATABASE() AND EVENT_OBJECT_TABLE = 'audit_log'"))}
-            triggers = [(n, ddl) for n, ddl in triggers if n not in existing]
         for _, ddl in triggers:
             conn.execute(ddl)
