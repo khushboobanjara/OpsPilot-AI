@@ -19,3 +19,4 @@ PyJWT>=2.8
 python-multipart>=0.0.9
 faiss-cpu>=1.8.0
 python-docx>=1.1.0
+sentence-transformers
