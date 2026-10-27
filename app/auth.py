@@ -6,6 +6,10 @@
   Each user has a token_version; changing a password/role or disabling the account bumps it, which revokes old tokens.
 - Cookie sessions also check the Origin header on state-changing requests (CSRF defence in depth).
 - Roles: admin, reviewer, viewer. A separate "service" principal (the ingest API key) may only POST /emails.
+- Guests (public showcase, off by default): POST /auth/guest issues a short-lived signed session that is NOT a user row.
+  A guest is always the least privileged role (viewer) and is read-only: every request that is not GET/HEAD/OPTIONS is refused
+  here, in one place, except the two safe demonstration calls listed in GUEST_WRITE_ALLOWED (ask the assistant, search documents).
+  The refusal does not depend on any route remembering to ask for it.
 - With auth disabled (the default for local development) nothing here applies and behaviour is unchanged."""
 import re
 import secrets
@@ -25,6 +29,11 @@ ROLES = ("admin", "reviewer", "viewer")
 COOKIE = "opspilot_session"
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_.-]{3,40}$")
 SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
+GUEST_PREFIX = "guest-"
+GUEST_NAME_RE = re.compile(r"^guest-[0-9a-f]{12}$")
+# The ONLY non-read requests a guest may make. Both change nothing about the business data (they read it and write an audit row),
+# and both have their own per-session and global budgets (app/guest.py). Anything not listed here is refused for guests.
+GUEST_WRITE_ALLOWED = frozenset({("POST", "/chat"), ("POST", "/rag/search")})
 _hasher = PasswordHasher()
 _DUMMY_HASH = _hasher.hash("timing-equaliser")
 
@@ -35,6 +44,7 @@ class Principal:
     role: str
     user_id: int | None = None
     via: str = "session"          # session | api_key | auth-disabled
+    guest: bool = False           # a public-demo session: read-only, never backed by a users row
 
 
 # ---------------------------------------------------------------- passwords and tokens
@@ -70,11 +80,44 @@ def make_token(user: User) -> str:
     return jwt.encode(claims, _secret(), algorithm="HS256")
 
 
+def guest_access_on() -> bool:
+    return bool(settings.guest_enabled and settings.auth_enabled)
+
+
+def guest_may(method: str, path: str) -> bool:
+    """Whether a guest session may make this request. Reads are always fine; the only writes are GUEST_WRITE_ALLOWED."""
+    if method.upper() in SAFE_METHODS:
+        return True
+    return (method.upper(), path.rstrip("/") or "/") in GUEST_WRITE_ALLOWED
+
+
+def make_guest_token() -> tuple[str, str]:
+    """-> (token, guest name). The role is not in the token: a guest is always 'viewer', decided on the server."""
+    name = GUEST_PREFIX + secrets.token_hex(6)
+    now = datetime.now(timezone.utc)
+    claims = {"sub": name, "tv": settings.guest_epoch, "gst": True, "iat": now,
+              "exp": now + timedelta(minutes=settings.guest_session_minutes)}
+    return jwt.encode(claims, _secret(), algorithm="HS256"), name
+
+
+def _guest_principal(claims: dict) -> Principal | None:
+    """A guest token is honoured only while guest access is on, the name has the exact generated shape, and the epoch matches
+    (raising OPSPILOT_GUEST_EPOCH ends every open guest session at once)."""
+    name = claims.get("sub")
+    if not guest_access_on() or not isinstance(name, str) or not GUEST_NAME_RE.match(name):
+        return None
+    if claims.get("tv") != settings.guest_epoch:
+        return None
+    return Principal(name, "viewer", None, "session", True)
+
+
 def _principal_from_token(token: str) -> Principal | None:
     try:
         claims = jwt.decode(token, _secret(), algorithms=["HS256"], options={"require": ["exp", "sub", "tv"]})
     except jwt.PyJWTError:
         return None
+    if claims.get("gst") is True:
+        return _guest_principal(claims)
     with SessionLocal() as s:
         user = s.get(User, int(claims["sub"]))
         if user is None or not user.is_active or user.token_version != claims["tv"]:
@@ -91,7 +134,7 @@ def resolve_principal(request: Request) -> Principal | None:
         if p:
             # "bearer" skips the Origin/CSRF check, so it must mean the token really came from the Authorization header;
             # a cookie session stays "session" even if some proxy added a different Authorization header (e.g. Basic).
-            return Principal(p.username, p.role, p.user_id, "bearer" if bearer else "session")
+            return Principal(p.username, p.role, p.user_id, "bearer" if bearer else "session", p.guest)
     expected = settings.api_key.get_secret_value()
     supplied = request.headers.get("x-api-key", "")
     if expected and supplied and secrets.compare_digest(supplied.encode(), expected.encode()):
@@ -109,6 +152,8 @@ def require_roles(*roles: str):
             raise HTTPException(401, "Authentication required", headers={"WWW-Authenticate": "Bearer"})
         if principal.role not in roles:
             raise HTTPException(403, "Your role is not allowed to do this")
+        if principal.guest and not guest_may(request.method, request.url.path):
+            raise HTTPException(403, "Guest sessions are read-only")
         origin = request.headers.get("origin")
         if (principal.via == "session" and request.method not in SAFE_METHODS and origin
                 and urlparse(origin).netloc != request.headers.get("host")):
@@ -211,6 +256,29 @@ def startup_checks_and_bootstrap_pre() -> None:
             raise RuntimeError("Refusing to start in production: " + "; ".join(problems))
     if settings.auth_enabled:
         _secret()                                          # raises if too short
+    guest_startup_checks()
+
+
+def guest_startup_checks() -> None:
+    """Fail closed: guest access only starts in a configuration that cannot expose real data or hand out real privileges."""
+    if not settings.guest_enabled:
+        return
+    problems = []
+    if not settings.auth_enabled:
+        problems.append("OPSPILOT_AUTH_ENABLED must be true (guest access is a signed session)")
+    if settings.demo_mode:
+        problems.append("OPSPILOT_GUEST_ENABLED cannot be combined with OPSPILOT_DEMO_MODE (that mode wipes the whole database, users included)")
+    if settings.imap_host or settings.imap_user:
+        problems.append("OPSPILOT_IMAP_* is set: a guest must never be able to read a real mailbox's invoices; use a separate sample-data deployment")
+    if not 1 <= settings.guest_session_minutes <= 240:
+        problems.append("OPSPILOT_GUEST_SESSION_MINUTES must be between 1 and 240")
+    if settings.guest_epoch < 1:
+        problems.append("OPSPILOT_GUEST_EPOCH must be 1 or more")
+    if min(settings.guest_logins_per_minute_per_ip, settings.guest_logins_per_minute_global, settings.guest_chat_per_session,
+           settings.guest_search_per_session, settings.guest_chat_per_day_global) < 1:
+        problems.append("the OPSPILOT_GUEST_* limits must all be at least 1")
+    if problems:
+        raise RuntimeError("Refusing to start guest access: " + "; ".join(problems))
 
 
 def startup_checks_and_bootstrap() -> None:

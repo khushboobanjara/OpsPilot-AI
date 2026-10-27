@@ -8,6 +8,8 @@ from app.security import WriteRateLimiter
 
 router = APIRouter()
 login_limiter = WriteRateLimiter()
+guest_ip_limiter = WriteRateLimiter()
+guest_global_limiter = WriteRateLimiter()
 any_user = auth.require_roles("admin", "reviewer", "viewer")
 admin_only = auth.require_roles("admin")
 
@@ -45,6 +47,25 @@ def login(payload: LoginIn, request: Request, response: Response):
     return {"user": auth.user_dict(user), "access_token": token, "token_type": "bearer"}
 
 
+@router.post("/auth/guest")
+def guest_login(request: Request, response: Response):
+    """Start a read-only demo session for a public visitor. No credentials: the session can only ever read sample data."""
+    if not auth.guest_access_on():
+        raise HTTPException(404, "Guest access is not enabled")
+    ip = request.client.host if request.client else "unknown"
+    if not guest_ip_limiter.allow(ip, settings.guest_logins_per_minute_per_ip) or \
+            not guest_global_limiter.allow("all", settings.guest_logins_per_minute_global):
+        raise HTTPException(429, "Too many demo sessions started, please wait a minute", headers={"Retry-After": "60"})
+    token, name = auth.make_guest_token()
+    with SessionLocal() as s:
+        auth._audit(s, "guest_login", name, None, None)
+        s.commit()
+    response.set_cookie(auth.COOKIE, token, httponly=True, samesite="strict", secure=settings.cookie_secure,
+                        max_age=settings.guest_session_minutes * 60, path="/")
+    # The token is deliberately NOT returned in the body: the browser only needs the HttpOnly cookie.
+    return {"user": {"username": name, "role": "viewer", "guest": True}, "expires_in_minutes": settings.guest_session_minutes}
+
+
 @router.post("/auth/logout")
 def logout(response: Response):
     response.delete_cookie(auth.COOKIE, path="/")
@@ -53,7 +74,10 @@ def logout(response: Response):
 
 @router.get("/auth/me")
 def me(principal: auth.Principal = Depends(any_user)):
-    return {"auth_enabled": settings.auth_enabled, "username": principal.username, "role": principal.role}
+    data = {"auth_enabled": settings.auth_enabled, "username": principal.username, "role": principal.role}
+    if principal.guest:
+        data["guest"] = True
+    return data
 
 
 @router.get("/users")

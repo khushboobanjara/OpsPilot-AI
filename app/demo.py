@@ -63,3 +63,37 @@ def reset_and_seed(pipeline) -> int:
     except Exception:
         pass
     return seed(pipeline)
+
+
+def seed_guest_data(pipeline) -> dict:
+    """Guest showcase: load the sample invoices once, only into an EMPTY database. Never wipes anything (unlike demo mode), so
+    real users and any documents an admin added are untouched. Returns what was loaded."""
+    from app.db import Email, SessionLocal
+    with SessionLocal() as s:
+        empty = s.query(Email).first() is None
+    return {"invoices": seed(pipeline) if empty else 0}
+
+
+def seed_guest_documents(actor: str = "guest-seed") -> int:
+    """Guest showcase: index the sample policy documents (readable by every signed-in role) so document Q&A has something to
+    answer from. Skipped when document search is off or any document already exists. Returns how many were stored."""
+    if not settings.rag_enabled:
+        return 0
+    from pathlib import Path
+    from app.rag.extract import SUPPORTED
+    from app.rag.service import RagError, get_service
+    folder = Path(settings.guest_sample_docs_dir)
+    files = sorted(p for p in folder.glob("*") if p.is_file() and p.suffix.lower() in SUPPORTED) if folder.is_dir() else []
+    if not files:
+        return 0
+    svc = get_service()
+    if svc.list_documents("admin"):
+        return 0
+    stored = 0
+    for f in files:
+        try:
+            svc.ingest(data=f.read_bytes(), filename=f.name, title=None, min_role="viewer", actor=actor)
+            stored += 1
+        except RagError:
+            continue
+    return stored

@@ -25,7 +25,9 @@ def principal_from_token(token: str) -> Principal | None:
     if len(key) >= MIN_KEY_LENGTH and secrets.compare_digest(token.encode(), key.encode()):
         return Principal("mcp-system", "service", None, SYSTEM_VIA)
     user = app_auth._principal_from_token(token)             # the application's own JWT check (module-private by name only)
-    return Principal(user.username, user.role, user.user_id, "bearer") if user else None
+    if user is None or user.guest:                           # a public-demo guest session is never an MCP credential
+        return None
+    return Principal(user.username, user.role, user.user_id, "bearer")
 
 
 def bearer_token(authorization_header: str) -> str:

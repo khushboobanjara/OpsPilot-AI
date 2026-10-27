@@ -126,6 +126,7 @@
     <div class="sidefoot"><div class="whobox" id="who" hidden><span>Signed in as <b id="whoName"></b> (<span id="whoRole"></span>)</span><button id="logout">Sign out</button></div><button id="demo" data-roles="admin reviewer">Load demo data</button><a href="/docs">API docs</a></div>
   </aside>
   <div class="content">
+    <div id="guestBanner" hidden style="background:#0f2f2a;color:#9fe6d4;padding:8px 16px;font-size:13px;text-align:center">Read-only demo session with sample data. You can browse everything, ask the AI assistant and search the documents. Please do not type personal or confidential information: questions are sent to the AI provider.</div>
     <div id="banner" hidden style="background:#3b2f0b;color:#f5d98b;padding:8px 16px;font-size:13px;text-align:center"></div>
     <div class="topbar"><input id="search" placeholder="Search invoices by number, vendor or email..."><button id="refresh">Refresh</button></div>
     <main id="view"></main>
@@ -134,7 +135,11 @@
 <div id="login" hidden><form id="loginForm"><h2 style="margin:0">Sign in to OpsPilot</h2>
   <label>Username<input id="lu" autocomplete="username" maxlength="100"></label>
   <label>Password<input id="lp" type="password" autocomplete="current-password" maxlength="200"></label>
-  <div class="err" id="lerr"></div><button class="primary">Sign in</button><div class="hint" id="demoHint"></div></form></div>
+  <div class="err" id="lerr"></div><button class="primary">Sign in</button>
+  <div id="guestBox" hidden style="margin-top:14px;padding-top:14px;border-top:1px solid var(--border,#2a3140);text-align:center">
+    <button type="button" id="guestBtn">Try the live demo (read-only)</button>
+    <div class="hint" style="margin-top:6px">No account needed. Sample data only; nothing you do can change it.</div></div>
+  <div class="hint" id="demoHint"></div></form></div>
 <dialog id="audit"><div id="auditBody"></div><div style="text-align:right"><button id="closeAudit">Close</button></div></dialog>
 
 <script>
@@ -155,7 +160,9 @@ function setActive() { document.querySelectorAll(".nav").forEach(b => b.classLis
 function applyRole() {
   document.querySelectorAll("[data-roles]").forEach(el => (el.hidden = !can(el.dataset.roles)));
   $("#who").hidden = !(authEnabled && me);
-  if (me) { $("#whoName").textContent = me.username; $("#whoRole").textContent = me.role; }
+  if (me) { $("#whoName").textContent = me.username; $("#whoRole").textContent = me.guest ? "guest, read-only" : me.role; }
+  const gb = $("#guestBanner");
+  if (gb) { gb.hidden = !(me && me.guest); }
   const nav = document.querySelector(`.nav[data-tab="${tab}"]`);
   if (nav && nav.hidden) { tab = "home"; setActive(); }
 }
@@ -695,10 +702,18 @@ $("#loginForm").onsubmit = async e => {
   if (!r.ok) { $("#lerr").textContent = (d && typeof d.detail === "string" && d.detail) || "Sign-in failed"; return; }
   me = d.user; $("#lp").value = ""; $("#login").hidden = true; applyRole(); refresh();
 };
+$("#guestBtn").onclick = async () => {
+  $("#lerr").textContent = "";
+  const r = await fetch("/auth/guest", { method: "POST" });
+  const d = await r.json().catch(() => null);
+  if (!r.ok) { $("#lerr").textContent = (d && typeof d.detail === "string" && d.detail) || "Could not start the demo"; return; }
+  me = d.user; $("#login").hidden = true; applyRole(); refresh();
+};
 $("#logout").onclick = async () => { await fetch("/auth/logout", { method: "POST" }); me = null; applyRole(); showLogin(); };
 (async function boot() {
   const h = await fetch("/health").then(r => r.json()).catch(() => ({}));
   authEnabled = !!h.auth_enabled;
+  $("#guestBox").hidden = !h.guest_access;
   if (h.demo_mode) { const b = $("#banner"); b.hidden = false; b.textContent = "Public demo with sample data. Anything you do here is wiped automatically every hour."; }
   if (authEnabled) {
     if (h.demo_accounts) $("#demoHint").textContent = `Demo accounts (password ${h.demo_accounts.password}): ${h.demo_accounts.users.join(", ")}`;

@@ -19,6 +19,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, ConfigDict, Field
 
+from app import guest
 from app.auth import Principal, require_roles
 from app.config import settings
 from app.rag import audit
@@ -126,6 +127,7 @@ def search(payload: SearchIn, principal: Principal = Depends(ANY)):
     svc = _service()
     if not search_limiter.allow(f"rag:{principal.username}", settings.rag_search_rate_limit_per_minute):
         raise HTTPException(429, "Too many searches. Wait a minute and try again.", headers={"Retry-After": "60"})
+    guest.charge(principal, "search")
     started = time.perf_counter()
     try:
         result = svc.search(principal.role, payload.query, payload.limit)
