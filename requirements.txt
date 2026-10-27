@@ -4,7 +4,7 @@ pydantic-settings>=2.0
 scikit-learn>=1.4
 pandas>=2.0
 rapidfuzz>=3.0
-fastapi>=0.110
+fastapi==0.115.12
 uvicorn>=0.29
 pytest>=8.0
 joblib>=1.3

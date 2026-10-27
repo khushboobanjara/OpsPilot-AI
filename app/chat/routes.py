@@ -18,6 +18,7 @@ from app.auth import Principal, require_roles
 from app.chat import audit, service
 from app.chat.errors import GroqError, public_message
 from app.chat.groq_client import GroqClient
+from app import guest
 from app.config import settings
 from app.mcp_server import rbac
 from app.mcp_server.server import server
@@ -106,6 +107,7 @@ def chat(payload: ChatIn, principal: Principal = Depends(ANY)):
         raise HTTPException(403, "This account cannot use the assistant")
     if not chat_limiter.allow(f"chat:{principal.username}", settings.chat_rate_limit_per_minute):
         raise HTTPException(429, "Too many questions. Wait a minute and try again.", headers={"Retry-After": "60"})
+    guest.charge(principal, "chat")                                           # guests: small per-session and daily budgets
 
     model = settings.groq_model
     started = time.perf_counter()

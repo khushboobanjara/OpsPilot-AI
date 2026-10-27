@@ -42,6 +42,20 @@ class Settings(BaseSettings):
     demo_mode: bool = False                 # public demo: seed sample data, rate-limit writes, reset on a schedule
     demo_writes_per_minute: int = 60
     demo_reset_minutes: int = 60
+    # Guest access for a public showcase (docs/GUEST_DEMO.md). Off by default. Requires authentication. A guest is NOT a user row:
+    # it is a short-lived signed session that is always read-only and can never be an admin or reviewer. Use a dedicated
+    # database that holds sample data only.
+    guest_enabled: bool = False
+    guest_session_minutes: int = 60                # how long one guest session lasts
+    guest_epoch: int = 1                           # raise it to end every guest session that is currently open
+    guest_logins_per_minute_per_ip: int = 10
+    guest_logins_per_minute_global: int = 120      # across all visitors: caps how fast guest sessions (and their audit rows) can be created
+    guest_chat_per_session: int = 15               # AI questions one guest session may ask (each one costs Groq tokens)
+    guest_search_per_session: int = 30             # document searches one guest session may run
+    guest_chat_per_day_global: int = 500           # AI questions all guests together may ask per UTC day: a hard ceiling on provider cost
+    guest_seed_on_start: bool = True               # load sample invoices (and sample documents, when document search is on) if the database is empty
+    guest_sample_docs_dir: str = "docs/sample_documents"
+
     # Mailbox integration (see .env.example). Credentials come from the environment or a git-ignored .env file.
     imap_host: str = ""
     imap_port: int = 993

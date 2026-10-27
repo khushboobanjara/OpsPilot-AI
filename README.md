@@ -254,6 +254,10 @@ Always on: request bodies over 1 MB get 413, and field lengths are capped (body 
 
 Known limits, stated plainly: with auth off there are no user accounts (a reviewer's name is typed in, not verified), the size cap relies on the `Content-Length` header so keep a proxy limit in front of anything public, and behind a reverse proxy run uvicorn with `--proxy-headers` so the rate limit sees real client IPs. Demo mode resets the database, so never point it at real data.
 
+### Guest access for a public link (LinkedIn, portfolio)
+
+Demo mode above wipes the database and cannot be combined with accounts, the assistant or document search. For a public link that shows the whole product, use **guest access** instead: set `OPSPILOT_AUTH_ENABLED=true` and `OPSPILOT_GUEST_ENABLED=true`, and the sign-in page gets a **Try the live demo (read-only)** button. A guest session needs no password, is not a user account, is always the least-privileged `viewer`, and is refused on every request that changes something (users, settings, reviews, uploads, deletes), except asking the assistant and searching the documents, which have their own budgets. Real accounts and the admin area work exactly as before. Environment variables, deployment steps and the threat model are in [docs/GUEST_DEMO.md](docs/GUEST_DEMO.md).
+
 ## Model registry and versions
 
 Every model file is identified by a content hash (`sha-...`). The same id is written to each audit row, so you can say exactly which model made a decision. Training writes a `<model>.meta.json` next to the file (algorithm, parameters, dataset, how it was evaluated and the metrics); on startup the registry records every model it can see and marks the ones being served as `production`. `GET /models` returns them; there is no automatic retraining or deployment.

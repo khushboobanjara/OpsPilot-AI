@@ -246,17 +246,66 @@ def _add_missing_columns() -> None:
                 conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}"))
 
 
+
 def _ensure_audit_triggers() -> None:
-    """Install append-only audit triggers on databases that support them."""
+    """Install append-only audit triggers where the database supports them."""
+    from sqlalchemy import inspect, text
+
     dialect = engine.dialect.name
 
-    # SQLite supports these triggers. TiDB does not support MySQL triggers.
-    if dialect != "sqlite":
-        return
+    if dialect == "sqlite":
+        for op in ("UPDATE", "DELETE"):
+            trigger_name = f"audit_log_no_{op.lower()}"
+            ddl = (
+                f"CREATE TRIGGER IF NOT EXISTS {trigger_name} "
+                f"BEFORE {op} ON audit_log "
+                "BEGIN SELECT RAISE(ABORT, 'audit_log is append-only'); END"
+            )
+            with engine.begin() as conn:
+                conn.execute(text(ddl))
 
-    triggers = [(name, ddl) for name, db_dialect, ddl in _AUDIT_TRIGGERS
-                if db_dialect == dialect]
+    elif dialect == "mysql":
+        inspector = inspect(engine)
 
-    with engine.begin() as conn:
-        for _, ddl in triggers:
-            conn.execute(ddl)
+        # TiDB does not support MySQL triggers.
+        try:
+            with engine.connect() as conn:
+                version = conn.execute(text("SELECT VERSION()")).scalar() or ""
+        except Exception:
+            raise
+
+        if "tidb" in version.lower():
+            return
+
+        existing = {
+            trigger["name"]
+            for trigger in inspector.get_check_constraints("audit_log")
+        } if False else set()
+
+        with engine.connect() as conn:
+            existing = set(
+                conn.execute(
+                    text(
+                        "SELECT TRIGGER_NAME "
+                        "FROM information_schema.TRIGGERS "
+                        "WHERE TRIGGER_SCHEMA = DATABASE() "
+                        "AND EVENT_OBJECT_TABLE = 'audit_log'"
+                    )
+                ).scalars()
+            )
+
+        for op in ("UPDATE", "DELETE"):
+            trigger_name = f"audit_log_no_{op.lower()}"
+
+            if trigger_name in existing:
+                continue
+
+            ddl = (
+                f"CREATE TRIGGER {trigger_name} "
+                f"BEFORE {op} ON audit_log FOR EACH ROW "
+                "SIGNAL SQLSTATE '45000' "
+                "SET MESSAGE_TEXT = 'audit_log is append-only'"
+            )
+
+            with engine.begin() as conn:
+                conn.execute(text(ddl))

@@ -75,6 +75,7 @@ def create_app(pipeline_factory: Callable = build_pipeline) -> FastAPI:
         chat_routes.startup_checks()                 # no-op unless OPSPILOT_CHAT_ENABLED=true
         rag_routes.startup_checks()                  # no-op unless OPSPILOT_RAG_ENABLED=true
         init_db()
+        docs_task = None
         auth.startup_checks_and_bootstrap()
         if settings.demo_mode and settings.auth_enabled:
             auth.seed_demo_users()
@@ -88,6 +89,18 @@ def create_app(pipeline_factory: Callable = build_pipeline) -> FastAPI:
                 await asyncio.to_thread(rag_routes.get_service().ensure_ready)
             except Exception as exc:                  # the service still starts; document search reports the problem when used
                 print(f"document search warm-up skipped: {type(exc).__name__}: {exc}")
+        if auth.guest_access_on() and settings.guest_seed_on_start:
+            try:
+                await asyncio.to_thread(demo.seed_guest_data, app.state.pipeline)
+            except Exception as exc:                  # a seeding problem must not stop the service; the dashboard just starts empty
+                print(f"guest sample data skipped: {type(exc).__name__}: {exc}")
+            if settings.rag_enabled:                   # indexing may download the embedding model: do it off the event loop
+                async def seed_docs():
+                    try:
+                        await asyncio.to_thread(demo.seed_guest_documents)
+                    except Exception as exc:
+                        print(f"guest sample documents skipped: {type(exc).__name__}: {exc}")
+                docs_task = asyncio.create_task(seed_docs())
         task = None
         if settings.demo_mode:
             with SessionLocal() as s:
@@ -98,6 +111,8 @@ def create_app(pipeline_factory: Callable = build_pipeline) -> FastAPI:
         yield
         if task:
             task.cancel()
+        if docs_task:
+            docs_task.cancel()
 
     guard = make_guard(WriteRateLimiter())
     app = FastAPI(title="OpsPilot AI", version="0.8.0", lifespan=lifespan, dependencies=[Depends(guard)])
@@ -127,7 +142,8 @@ def create_app(pipeline_factory: Callable = build_pipeline) -> FastAPI:
     @app.get("/health", include_in_schema=False)
     def health():
         info = {"status": "ok", "demo_mode": settings.demo_mode, "auth_enabled": settings.auth_enabled,
-                "auth_required": bool(settings.api_key.get_secret_value()) and not settings.auth_enabled}
+                "auth_required": bool(settings.api_key.get_secret_value()) and not settings.auth_enabled,
+                "guest_access": auth.guest_access_on()}
         if settings.demo_mode and settings.auth_enabled:       # the demo accounts are public on purpose and low-privilege
             info["demo_accounts"] = {"password": settings.demo_password, "users": ["demo_viewer", "demo_reviewer"]}
         return info
